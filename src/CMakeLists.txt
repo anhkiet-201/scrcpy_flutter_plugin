@@ -105,6 +105,9 @@ if(LOCAL_DEPS_DIR)
     add_library(avutil STATIC IMPORTED)
     set_target_properties(avutil PROPERTIES IMPORTED_LOCATION "${LOCAL_DEPS_DIR}/lib/${LIB_PREFIX}avutil.${LIB_EXT}")
     
+    add_library(swscale STATIC IMPORTED)
+    set_target_properties(swscale PROPERTIES IMPORTED_LOCATION "${LOCAL_DEPS_DIR}/lib/${LIB_PREFIX}swscale.${LIB_EXT}")
+    
     add_library(swresample STATIC IMPORTED)
     set_target_properties(swresample PROPERTIES IMPORTED_LOCATION "${LOCAL_DEPS_DIR}/lib/${LIB_PREFIX}swresample.${LIB_EXT}")
     
@@ -117,7 +120,7 @@ if(LOCAL_DEPS_DIR)
     set(FFMPEG_INCLUDE_DIRS "${LOCAL_DEPS_DIR}/include")
     set(SDL3_INCLUDE_DIRS "${LOCAL_DEPS_DIR}/include")
     
-    set(FFMPEG_LINK_LIBRARIES avformat avcodec avutil swresample dav1d)
+    set(FFMPEG_LINK_LIBRARIES avformat avcodec avutil swscale swresample dav1d)
     set(SDL3_LINK_LIBRARIES sdl3)
 else()
     find_package(PkgConfig REQUIRED)
@@ -125,6 +128,7 @@ else()
         libavformat
         libavcodec
         libavutil
+        libswscale
         libswresample
     )
     pkg_check_modules(SDL3 REQUIRED sdl3)
@@ -286,7 +290,11 @@ set_source_files_properties(${SCRCPY_SRC}/util/intr.c PROPERTIES
 
 # sc_process_observer (trong util/process.c) cũng gọi sc_process_wait.
 set_source_files_properties(${SCRCPY_SRC}/util/process.c PROPERTIES
-    COMPILE_DEFINITIONS "sc_process_wait=scrcpy_ffi_process_wait"
+    COMPILE_DEFINITIONS "sc_process_wait=scrcpy_ffi_process_wait;sc_process_execute_p=scrcpy_ffi_process_execute_p"
+)
+
+set_source_files_properties(${SCRCPY_SRC}/adb/adb.c PROPERTIES
+    COMPILE_DEFINITIONS "sc_process_execute_p=scrcpy_ffi_process_execute_p;sc_process_wait=scrcpy_ffi_process_wait"
 )
 
 # Decode interception is isolated to the two upstream translation units that
@@ -414,6 +422,4 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/scrcpy_ffi.h"
     DESTINATION "${CMAKE_INSTALL_PREFIX}/include"
 )
 
-set_source_files_properties(${SCRCPY_SRC}/adb/adb.c PROPERTIES
-    COMPILE_DEFINITIONS "sc_process_wait=scrcpy_ffi_process_wait"
-)
+# NOTE: adb.c overrides are defined above (sc_process_execute_p + sc_process_wait).

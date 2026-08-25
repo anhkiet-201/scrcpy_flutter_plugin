@@ -28,6 +28,7 @@
 // FFmpeg
 #include <libavcodec/avcodec.h>
 #include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/error.h>
@@ -76,6 +77,7 @@ typedef struct ScrcpyFfiInstance ScrcpyFfiInstance;
 typedef struct {
     ScrcpyFfiInstance* instance;
     uint64_t applied_decode_generation;
+    enum AVPixelFormat expected_hw_format;
 } ScrcpyCodecBinding;
 
 /**
@@ -219,11 +221,11 @@ extern void scrcpy_ffi_kill_zombie_server(const char *serial);
 // SDL Clipboard overrides
 extern bool sc_SDL_IsMainThread(void);
 extern int sc_SDL_SetClipboardText(const char *text);
-extern char *sc_SDL_GetClipboardText(void);
-
 // Log configuration
 extern void sc_log_configure(void);
 
-#endif // SCRCPY_FFI_INTERNAL_H
-
 extern sc_exit_code scrcpy_ffi_process_wait(sc_pid pid, bool close);
+extern enum sc_process_result scrcpy_ffi_process_execute_p(const char *const argv[], sc_pid *pid, unsigned flags,
+                                                           sc_pipe *pin, sc_pipe *pout, sc_pipe *perr);
+
+#endif // SCRCPY_FFI_INTERNAL_H
