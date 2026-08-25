@@ -2,6 +2,8 @@
 
 #include "../src/scrcpy_ffi.h"
 
+
+
 #include <cstring>
 #include <iostream>
 #include <iomanip>
@@ -35,6 +37,7 @@ ScrcpyVideoTexture::~ScrcpyVideoTexture() {
   ReleaseResources();
 }
 
+
 void ScrcpyVideoTexture::ReleaseResources() {
   std::lock_guard<std::mutex> lock(mutex_);
   output_view_.Reset();
@@ -48,7 +51,13 @@ void ScrcpyVideoTexture::ReleaseResources() {
   last_visible_height_ = 0;
   last_input_format_ = DXGI_FORMAT_UNKNOWN;
   last_serial_ = 0;
+  // SW path state
+  last_sw_width_ = 0;
+  last_sw_height_ = 0;
+  bgra_buffer_.clear();
+  bgra_buffer_.shrink_to_fit();
 }
+
 
 bool ScrcpyVideoTexture::ConfigureProcessor(
     const D3D11_TEXTURE2D_DESC& input_desc,
@@ -242,6 +251,105 @@ bool ScrcpyVideoTexture::ConvertToBgra(
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Software fallback path: YUV420P → BGRA (sws_scale) → UpdateSubresource
+// ---------------------------------------------------------------------------
+
+bool ScrcpyVideoTexture::EnsureSoftwareOutputTexture(UINT width, UINT height) {
+  if (output_texture_ && last_sw_width_ == width && last_sw_height_ == height) {
+    return true;
+  }
+
+  // Reset HW path state that shares output_texture_
+  output_view_.Reset();
+  processor_.Reset();
+  processor_enumerator_.Reset();
+  output_texture_.Reset();
+  shared_handle_ = nullptr;
+  last_source_width_ = 0;
+  last_source_height_ = 0;
+  last_input_format_ = DXGI_FORMAT_UNKNOWN;
+
+  D3D11_TEXTURE2D_DESC desc = {};
+  desc.Width = width;
+  desc.Height = height;
+  desc.MipLevels = 1;
+  desc.ArraySize = 1;
+  desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+  HRESULT hr = d3d_device_->CreateTexture2D(&desc, nullptr,
+                                             output_texture_.GetAddressOf());
+  if (FAILED(hr)) {
+    std::cerr << "FFI Windows SW: CreateTexture2D(BGRA) failed: HRESULT=0x"
+              << std::hex << HResultCode(hr) << std::dec << std::endl;
+    return false;
+  }
+
+  Microsoft::WRL::ComPtr<IDXGIResource> dxgi;
+  hr = output_texture_.As(&dxgi);
+  if (FAILED(hr)) return false;
+  hr = dxgi->GetSharedHandle(&shared_handle_);
+  if (FAILED(hr) || !shared_handle_) {
+    std::cerr << "FFI Windows SW: GetSharedHandle failed: HRESULT=0x"
+              << std::hex << HResultCode(hr) << std::dec << std::endl;
+    output_texture_.Reset();
+    return false;
+  }
+
+  last_sw_width_ = width;
+  last_sw_height_ = height;
+  last_visible_width_ = width;
+  last_visible_height_ = height;
+  std::cerr << "FFI Windows SW: output texture created " << width << "x" << height
+            << std::endl;
+  return true;
+}
+
+bool ScrcpyVideoTexture::UploadSoftwareFrame(void* av_frame_ptr,
+                                              int32_t width, int32_t height) {
+  if (!av_frame_ptr || width <= 0 || height <= 0) return false;
+
+  const UINT w = static_cast<UINT>(width);
+  const UINT h = static_cast<UINT>(height);
+
+  if (!EnsureSoftwareOutputTexture(w, h)) return false;
+
+  // Allocate / reuse BGRA CPU buffer.
+  // Add safety padding (+256 bytes) to protect against SIMD vector store
+  // overshoot in FFmpeg's sws_scale (prevent CRT Heap Corruption in debug builds).
+  const size_t stride = static_cast<size_t>(w) * 4;
+  bgra_buffer_.resize(stride * h + 256);
+
+  // Convert CPU YUV frame to BGRA via exported FFI function
+  if (!ffi_scrcpy_convert_software_frame_to_bgra(
+          av_frame_ptr, bgra_buffer_.data(), static_cast<int32_t>(stride),
+          width, height)) {
+    std::cerr << "FFI Windows SW: ffi_scrcpy_convert_software_frame_to_bgra failed"
+              << std::endl;
+    return false;
+  }
+
+  // Upload BGRA buffer to D3D11 texture via DMA (UpdateSubresource)
+  d3d_context_->UpdateSubresource(
+      output_texture_.Get(), 0, nullptr,
+      bgra_buffer_.data(),
+      static_cast<UINT>(stride), 0);
+  d3d_context_->Flush();
+
+  HRESULT removed = d3d_device_->GetDeviceRemovedReason();
+  if (FAILED(removed)) {
+    std::cerr << "FFI Windows SW: D3D11 Device removed! Reason: 0x"
+              << std::hex << HResultCode(removed) << std::dec << std::endl;
+    return false;
+  }
+  return true;
+}
+
+
 const FlutterDesktopGpuSurfaceDescriptor* ScrcpyVideoTexture::CopyGpuSurface(
     size_t width, size_t height) {
   (void)width;
@@ -257,7 +365,11 @@ const FlutterDesktopGpuSurfaceDescriptor* ScrcpyVideoTexture::CopyGpuSurface(
   }
 
   bool ready = false;
+
   if (frame.backend == SCRCPY_GPU_FRAME_D3D11 && frame.native_handle) {
+    // ----------------------------------------------------------------
+    // Hardware path: VideoProcessor NV12 → BGRA
+    // ----------------------------------------------------------------
     auto* source = static_cast<ID3D11Texture2D*>(frame.native_handle);
     if (!UsesSameDevice(source, d3d_device_.Get())) {
       std::cerr << "FFI Windows: decoded texture belongs to a different "
@@ -286,7 +398,21 @@ const FlutterDesktopGpuSurfaceDescriptor* ScrcpyVideoTexture::CopyGpuSurface(
         last_serial_ = frame.serial;
       }
     }
+
+  } else if (frame.backend == SCRCPY_GPU_FRAME_SOFTWARE && frame.frame_ref) {
+    // ----------------------------------------------------------------
+    // Software fallback path: sws_scale YUV420P → BGRA → UpdateSubresource
+    // ----------------------------------------------------------------
+    if (frame.serial != last_serial_) {
+      ready = UploadSoftwareFrame(frame.frame_ref, frame.width, frame.height);
+      if (ready) {
+        last_serial_ = frame.serial;
+      }
+    } else {
+      ready = output_texture_ != nullptr;
+    }
   }
+
   ffi_scrcpy_release_gpu_frame(&frame);
 
   if (!ready || !output_texture_) {
@@ -300,5 +426,6 @@ const FlutterDesktopGpuSurfaceDescriptor* ScrcpyVideoTexture::CopyGpuSurface(
   gpu_descriptor_->format = kFlutterDesktopPixelFormatBGRA8888;
   return gpu_descriptor_.get();
 }
+
 
 }  // namespace scrcpy_flutter_plugin

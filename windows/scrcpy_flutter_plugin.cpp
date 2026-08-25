@@ -252,11 +252,19 @@ void ScrcpyFlutterPlugin::HandleMethodCall(
       void* instance_handle = reinterpret_cast<void*>(handle_addr);
       tex_it->second.texture->SetInstanceHandle(instance_handle);
 
-      // The FFI function takes its own COM reference. The plugin and decoder
-      // therefore share the exact device without ambiguous ownership.
       if (instance_handle &&
           tex_it->second.bound_instance_handle != instance_handle) {
-        ffi_scrcpy_set_d3d11_device(instance_handle, d3d_device_.Get());
+        // Retry EnsureD3D11Device() in case it failed earlier (e.g. the
+        // Flutter view was not yet ready at createTexture time).
+        if (!d3d_device_ && !EnsureD3D11Device()) {
+          std::cerr << "FFI Windows: D3D11 device still unavailable; "
+                    << "native software-decode fallback will be used."
+                    << std::endl;
+        }
+        // Pass the device (or nullptr to trigger SW fallback in the C layer).
+        ffi_scrcpy_set_d3d11_device(instance_handle,
+                                     d3d_device_ ? d3d_device_.Get()
+                                                 : nullptr);
         tex_it->second.bound_instance_handle = instance_handle;
       }
     }

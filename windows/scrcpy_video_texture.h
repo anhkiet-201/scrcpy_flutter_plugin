@@ -8,12 +8,18 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <vector>
+
 
 namespace scrcpy_flutter_plugin {
 
 // Converts the decoder's NV12/P010 D3D surface into a BGRA texture on the GPU.
 // Flutter's Windows external-texture bridge imports RGBA-compatible D3D11
 // textures; handing it the decoder's NV12 texture is not valid.
+//
+// When D3D11VA hardware acceleration is unavailable the class falls back to a
+// software path: sws_scale converts the CPU YUV420P AVFrame to BGRA, which is
+// then uploaded via UpdateSubresource().
 class ScrcpyVideoTexture {
  public:
   ScrcpyVideoTexture(ID3D11Device* device, ID3D11DeviceContext* context);
@@ -42,6 +48,7 @@ class ScrcpyVideoTexture {
   std::mutex mutex_;
   HANDLE shared_handle_ = nullptr;
 
+  // HW path tracking
   size_t last_source_width_ = 0;
   size_t last_source_height_ = 0;
   size_t last_visible_width_ = 0;
@@ -49,10 +56,17 @@ class ScrcpyVideoTexture {
   DXGI_FORMAT last_input_format_ = DXGI_FORMAT_UNKNOWN;
   uint64_t last_serial_ = 0;
 
+  // SW path: YUV420P → BGRA via ffi_scrcpy_convert_software_frame_to_bgra + UpdateSubresource
+  std::vector<uint8_t> bgra_buffer_;
+  UINT last_sw_width_ = 0;
+  UINT last_sw_height_ = 0;
+
   bool ConfigureProcessor(const D3D11_TEXTURE2D_DESC& input_desc,
                           UINT visible_width, UINT visible_height);
   bool ConvertToBgra(ID3D11Texture2D* source, UINT source_index,
                      UINT visible_width, UINT visible_height);
+  bool EnsureSoftwareOutputTexture(UINT width, UINT height);
+  bool UploadSoftwareFrame(void* av_frame_ptr, int32_t width, int32_t height);
   void ReleaseResources();
 };
 

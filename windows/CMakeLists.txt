@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.14)
+﻿cmake_minimum_required(VERSION 3.14)
 set(PROJECT_NAME "scrcpy_flutter_plugin")
 project(${PROJECT_NAME} LANGUAGES CXX)
 
@@ -35,6 +35,10 @@ set_target_properties(${PLUGIN_NAME} PROPERTIES
 
 target_compile_definitions(${PLUGIN_NAME} PRIVATE FLUTTER_PLUGIN_IMPL)
 
+if(MSVC)
+  target_compile_options(${PLUGIN_NAME} PRIVATE /wd4244 /wd4267)
+endif()
+
 target_include_directories(${PLUGIN_NAME} PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
@@ -48,7 +52,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   scrcpy_ffi
 )
 
-# Tự động copy các file DLL phụ thuộc của ADB vào thư mục build đầu ra
+# Tá»± Ä‘á»™ng copy cÃ¡c file DLL phá»¥ thuá»™c cá»§a ADB vÃ o thÆ° má»¥c build Ä‘áº§u ra
 add_custom_command(TARGET ${PLUGIN_NAME} POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
   "${CMAKE_CURRENT_SOURCE_DIR}/../assets/AdbWinApi.dll"
@@ -56,9 +60,12 @@ add_custom_command(TARGET ${PLUGIN_NAME} POST_BUILD
   $<TARGET_FILE_DIR:${PLUGIN_NAME}>
 )
 
-# Bundle both the plugin DLL and the FFI shared library.
+# Bundle both the plugin DLL, the FFI shared library, and required runtime assets.
 set(scrcpy_flutter_plugin_bundled_libraries
   "$<TARGET_FILE:${PLUGIN_NAME}>"
   "$<TARGET_FILE:scrcpy_ffi>"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../assets/scrcpy-server"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../assets/AdbWinApi.dll"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../assets/AdbWinUsbApi.dll"
   PARENT_SCOPE
 )
