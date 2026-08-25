@@ -1,0 +1,33 @@
+# ffigen.yaml — Cấu hình ffigen cho scrcpy_ffi
+name: ScrcpyFfiBindings
+description: Dart bindings cho libscrcpy_ffi.
+output: 'lib/src/bindings/scrcpy_bindings.dart'
+
+headers:
+  entry-points:
+    - 'src/scrcpy_ffi.h'
+  include-directives:
+    - '**scrcpy_ffi.h'
+
+functions:
+  include:
+    - 'ffi_scrcpy_.*'
+
+structs:
+  include:
+    - 'ScrcpyOptions'
+
+enums:
+  include:
+    - 'ScrcpyConnectionState'
+
+typedefs:
+  include:
+    - 'on_video_frame_ready_cb'
+    - 'on_audio_pcm_ready_cb'
+    - 'on_connection_state_cb'
+    - 'on_clipboard_changed_cb'
+
+comments:
+  style: any
+  length: full
