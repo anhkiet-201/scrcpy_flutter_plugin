@@ -242,14 +242,26 @@ static int scrcpy_worker_thread(void* arg) {
         .on_disconnected      = on_server_disconnected,
     };
 
-    // Kết hợp time + PID + monotonic clock để seed luôn unique ngay cả khi
+    // Kết hợp time + PID + high-res counter để seed luôn unique ngay cả khi
     // nhiều tiến trình scrcpy khởi động trong cùng 1 giây (tránh collision socket name).
+#ifdef _WIN32
+    // clock_gettime requires _WIN32_WINNT >= 0x0608 with UCRT/MinGW; use QPC instead.
+    // rand_r is POSIX-only and unavailable on Windows; use an inline LCG (Numerical Recipes).
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    unsigned int seed = (unsigned int)qpc.LowPart
+                      ^ (unsigned int)(qpc.HighPart)
+                      ^ (unsigned int)GetCurrentProcessId();
+    seed = seed * 1664525u + 1013904223u;
+    uint32_t scid = seed & 0x7FFFFFFF;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     unsigned int seed = (unsigned int)ts.tv_sec
                       ^ (unsigned int)(ts.tv_nsec)
                       ^ (unsigned int)getpid();
     uint32_t scid = ((uint32_t)rand_r(&seed)) & 0x7FFFFFFF;
+#endif
 
     // Force the Java server to use WARN if the requested level is INFO, to suppress [server] INFO logs
     enum sc_log_level server_log_level = s->options.log_level == SC_LOG_LEVEL_INFO ? SC_LOG_LEVEL_WARN : s->options.log_level;
