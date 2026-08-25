@@ -106,6 +106,17 @@ FFI_EXPORT void* ffi_scrcpy_start(
 FFI_EXPORT void ffi_scrcpy_stop(void* handle);
 
 /**
+ * Signals the session to stop without blocking. Returns immediately after
+ * setting running=false, nulling Dart callbacks, waking the worker thread
+ * and interrupting any in-progress ADB tunnel.
+ *
+ * The caller MUST eventually call ffi_scrcpy_stop() on a background thread
+ * to join the worker and free the handle's memory.
+ * Safe to call concurrently with or before ffi_scrcpy_stop().
+ */
+FFI_EXPORT void ffi_scrcpy_signal_stop(void* handle);
+
+/**
  * Cleans up and frees all scrcpy instances running in the background.
  * Call this when the app starts (or after a Hot Restart) to prevent orphaned FFI callbacks.
  */
@@ -152,6 +163,7 @@ typedef enum {
     SCRCPY_GPU_FRAME_D3D11 = 1,
     SCRCPY_GPU_FRAME_VIDEOTOOLBOX = 2,
     SCRCPY_GPU_FRAME_VAAPI = 3,
+    SCRCPY_GPU_FRAME_SOFTWARE = 4,  // CPU-decoded frame (YUV420P); Windows SW fallback
 } ScrcpyGpuFrameBackend;
 
 /**
@@ -309,6 +321,19 @@ FFI_EXPORT bool ffi_scrcpy_copy_to_nv12(
     int32_t dst_y_stride,
     uint8_t* dst_uv,
     int32_t dst_uv_stride
+);
+
+/**
+ * Converts a software-decoded frame (YUV420P / YUVJ420P) to BGRA format.
+ * `frame_ref` is the opaque AVFrame* from a ScrcpyGpuFrame with backend
+ * SCRCPY_GPU_FRAME_SOFTWARE.
+ */
+FFI_EXPORT bool ffi_scrcpy_convert_software_frame_to_bgra(
+    void* frame_ref,
+    uint8_t* dst_bgra,
+    int32_t dst_stride,
+    int32_t width,
+    int32_t height
 );
 
 /**

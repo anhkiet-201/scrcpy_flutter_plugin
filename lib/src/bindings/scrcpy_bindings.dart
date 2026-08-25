@@ -84,6 +84,21 @@ class ScrcpyFfiBindings {
   late final _ffi_scrcpy_stop = _ffi_scrcpy_stopPtr
       .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
 
+  /// Signals the session to stop without blocking. Returns immediately after
+  /// setting running=false, nulling callbacks, waking the worker loop and
+  /// interrupting the ADB tunnel. The caller must later call
+  /// [ffi_scrcpy_stop] on a background thread to join the worker and free memory.
+  void ffi_scrcpy_signal_stop(ffi.Pointer<ffi.Void> handle) {
+    return _ffi_scrcpy_signal_stop(handle);
+  }
+
+  late final _ffi_scrcpy_signal_stopPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>>(
+        'ffi_scrcpy_signal_stop',
+      );
+  late final _ffi_scrcpy_signal_stop = _ffi_scrcpy_signal_stopPtr
+      .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
+
   /// Cleans up and frees all scrcpy instances running in the background.
   /// Call this when the app starts (or after a Hot Restart) to prevent orphaned FFI callbacks.
   void ffi_scrcpy_cleanup_all() {

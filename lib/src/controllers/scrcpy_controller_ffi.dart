@@ -273,6 +273,11 @@ final class FfiScrcpyController implements ScrcpyController {
   }
 
   /// Stops the current scrcpy session. Safe to call multiple times.
+  ///
+  /// Phase 1 (synchronous, instant): signals the native layer to stop —
+  /// sets running=false, nulls callbacks, interrupts the ADB tunnel.
+  /// Phase 2 (async, background): joins the native worker thread and frees
+  /// memory on a separate isolate so the UI thread is never blocked.
   @override
   void stop() {
     if (_handle == null) return;
@@ -294,8 +299,15 @@ final class FfiScrcpyController implements ScrcpyController {
     // new start().
     _emitState(ScrcpyState.disconnected);
 
-    // ffi_scrcpy_stop is a blocking call that waits for the worker thread to exit.
+    // Phase 1 — non-blocking: signal the native side to stop immediately.
+    // This returns in microseconds and keeps the UI thread responsive.
+    _bindings.ffi_scrcpy_signal_stop(handle);
+
+    // Phase 2 — blocking join runs on a background isolate so the UI is free.
+    // ffi_scrcpy_stop() is idempotent when signal_stop already ran: it skips
+    // re-signaling and goes straight to sc_thread_join + free.
     _bindings.ffi_scrcpy_stop(handle);
+
 
     _releaseCallbacks();
   }

@@ -10,9 +10,6 @@
  * This is crucial for SDL overrides that lack custom user data parameters.
  */
 thread_local void* t_instance_handle = NULL;
-// avcodec_open2() invokes get_format synchronously on the decoder thread.
-// Keep the selected format in TLS rather than changing scrcpy's decoder API.
-static thread_local enum AVPixelFormat t_expected_hw_format = AV_PIX_FMT_NONE;
 
 /**
  * @brief Global collection of active scrcpy instances. Used to prevent callback leaks during Hot Restart.
@@ -571,15 +568,45 @@ FFI_EXPORT void* ffi_scrcpy_start(
         char* last_slash = strrchr(exe_path, '/');
         if (last_slash) {
             *last_slash = '\0'; // Lấy thư mục chứa file thực thi
-            snprintf(adb_path, sizeof(adb_path), "%s/data/flutter_assets/packages/scrcpy_flutter_plugin/assets/%s", exe_path, ADB_EXECUTABLE);
+            
+            // 1. Kiểm tra adb trong PATH hệ thống
+            bool has_system_adb = false;
+            const char *env_path = getenv("PATH");
+            if (env_path) {
+                char *path_copy = strdup(env_path);
+                if (path_copy) {
+                    char *token = strtok(path_copy, ":");
+                    while (token) {
+                        char test_adb[1024];
+                        snprintf(test_adb, sizeof(test_adb), "%s/adb", token);
+                        if (access(test_adb, X_OK) == 0) {
+                            has_system_adb = true;
+                            break;
+                        }
+                        token = strtok(NULL, ":");
+                    }
+                    free(path_copy);
+                }
+            }
+
+            if (has_system_adb) {
+                LOGD("FFI: System adb found in PATH");
+            } else {
+                snprintf(adb_path, sizeof(adb_path), "%s/data/flutter_assets/packages/scrcpy_flutter_plugin/assets/%s", exe_path, ADB_EXECUTABLE);
+                if (access(adb_path, F_OK) == 0) {
+                    chmod(adb_path, 0755);
+                    setenv("ADB", adb_path, 1);
+                    LOGD("FFI: System adb not found, fallback to bundled ADB: %s", adb_path);
+                } else {
+                    LOGW("FFI: Neither system adb nor bundled ADB asset found at: %s", adb_path);
+                }
+            }
+
             snprintf(server_path, sizeof(server_path), "%s/data/flutter_assets/packages/scrcpy_flutter_plugin/assets/scrcpy-server", exe_path);
-            
-            chmod(adb_path, 0755);
-            
-            setenv("ADB", adb_path, 1);
-            setenv("SCRCPY_SERVER_PATH", server_path, 1);
-            LOGD("FFI dynamic ADB path: %s", adb_path);
-            LOGD("FFI dynamic SCRCPY_SERVER_PATH: %s", server_path);
+            if (access(server_path, F_OK) == 0) {
+                setenv("SCRCPY_SERVER_PATH", server_path, 1);
+                LOGD("FFI dynamic SCRCPY_SERVER_PATH: %s", server_path);
+            }
         }
     } else {
         LOGW("FFI: Failed to read /proc/self/exe");
@@ -594,15 +621,32 @@ FFI_EXPORT void* ffi_scrcpy_start(
         if (last_slash) {
             *last_slash = L'\0';
             
-            wchar_t adb_path_w[1024] = {0};
+            // 1. Kiểm tra adb trong PATH hệ thống
+            wchar_t found_path[MAX_PATH];
+            DWORD found = SearchPathW(NULL, L"adb", L".exe", MAX_PATH, found_path, NULL);
+            if (found > 0) {
+                LOGD("FFI: System adb found in PATH: %ls", found_path);
+            } else {
+                // 2. Không có trong PATH -> Fallback về asset
+                wchar_t adb_path_w[1024] = {0};
+                swprintf(adb_path_w, 1024, L"%ls\\data\\flutter_assets\\packages\\scrcpy_flutter_plugin\\assets\\%hs", exe_path_w, ADB_EXECUTABLE);
+                DWORD attrs = GetFileAttributesW(adb_path_w);
+                if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                    SetEnvironmentVariableW(L"ADB", adb_path_w);
+                    LOGD("FFI: System adb not found, fallback to bundled ADB: %ls", adb_path_w);
+                } else {
+                    LOGW("FFI: Neither system adb nor bundled ADB asset found.");
+                }
+            }
+            
+            // 3. Cấu hình SCRCPY_SERVER_PATH từ assets
             wchar_t server_path_w[1024] = {0};
-            swprintf(adb_path_w, 1024, L"%ls\\data\\flutter_assets\\packages\\scrcpy_flutter_plugin\\assets\\%hs", exe_path_w, ADB_EXECUTABLE);
             swprintf(server_path_w, 1024, L"%ls\\data\\flutter_assets\\packages\\scrcpy_flutter_plugin\\assets\\scrcpy-server", exe_path_w);
-            
-            SetEnvironmentVariableW(L"ADB", adb_path_w);
-            SetEnvironmentVariableW(L"SCRCPY_SERVER_PATH", server_path_w);
-            
-            LOGD("FFI dynamic ADB path and SCRCPY_SERVER_PATH configured.");
+            DWORD s_attrs = GetFileAttributesW(server_path_w);
+            if (s_attrs != INVALID_FILE_ATTRIBUTES && !(s_attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                SetEnvironmentVariableW(L"SCRCPY_SERVER_PATH", server_path_w);
+                LOGD("FFI dynamic SCRCPY_SERVER_PATH: %ls", server_path_w);
+            }
         }
     } else {
         LOGW("FFI: Failed to get module file name on Windows.");
@@ -680,10 +724,26 @@ FFI_EXPORT void* ffi_scrcpy_start(
     return s;
 }
 
-FFI_EXPORT void ffi_scrcpy_stop(void* handle) {
+/**
+ * @brief Signals the scrcpy session to stop without blocking.
+ *
+ * This is a non-blocking companion to ffi_scrcpy_stop(). It immediately sets
+ * running=false, nulls the Dart callbacks (so no more native→Dart calls),
+ * wakes the worker thread's polling loop, and interrupts any in-progress ADB
+ * tunnel. The worker thread then proceeds to close sockets and join sub-threads
+ * in the background.
+ *
+ * After calling this, the caller MUST eventually call ffi_scrcpy_stop() (on a
+ * background thread) to join the worker and free memory. Until ffi_scrcpy_stop()
+ * returns the handle pointer must not be reused.
+ *
+ * Idempotent: safe to call more than once or concurrently with ffi_scrcpy_stop().
+ */
+FFI_EXPORT void ffi_scrcpy_signal_stop(void* handle) {
     ScrcpyFfiInstance* s = (ScrcpyFfiInstance*)handle;
     if (!s) return;
 
+    // Atomically mark stop as initiated. If already set, nothing to do.
     if (atomic_exchange(&s->stop_called, true)) {
         return;
     }
@@ -691,6 +751,7 @@ FFI_EXPORT void ffi_scrcpy_stop(void* handle) {
     remove_instance_from_global(s);
     atomic_store(&s->running, false);
 
+    // Null out callbacks immediately so no further Dart→native events fire.
     sc_mutex_lock(&s->buffer_mutex);
     s->video_cb     = NULL;
     s->audio_cb     = NULL;
@@ -698,14 +759,29 @@ FFI_EXPORT void ffi_scrcpy_stop(void* handle) {
     s->clipboard_cb = NULL;
     sc_mutex_unlock(&s->buffer_mutex);
 
+    // Wake the worker thread's polling loop so it exits without waiting 50 ms.
+    sc_mutex_lock(&s->mutex);
+    sc_cond_signal(&s->cond);
+    sc_mutex_unlock(&s->mutex);
+
+    // Interrupt any blocking ADB tunnel / socket connect in progress.
+    LOGD("FFI: [signal_stop] Interrupting server connection...");
+    sc_server_stop(&s->server);
+}
+
+FFI_EXPORT void ffi_scrcpy_stop(void* handle) {
+    ScrcpyFfiInstance* s = (ScrcpyFfiInstance*)handle;
+    if (!s) return;
+
+    // Signal stop first (idempotent — safe if signal_stop was already called).
+    // This sets running=false, nulls callbacks, wakes the worker loop and
+    // interrupts the ADB tunnel. If signal_stop already did all of this the
+    // atomic_exchange inside it returns immediately.
+    ffi_scrcpy_signal_stop(handle);
+
+    // Blocking part: wait for the worker thread to finish tearing down
+    // sockets, demuxers and the server connection, then free resources.
     if (s->worker_thread.thread != NULL) {
-        sc_mutex_lock(&s->mutex);
-        sc_cond_signal(&s->cond);
-        sc_mutex_unlock(&s->mutex);
-
-        LOGD("FFI: Calling sc_server_stop to interrupt pending connections...");
-        sc_server_stop(&s->server);
-
         LOGD("FFI: joining worker thread...");
         sc_thread_join(&s->worker_thread, NULL);
         s->worker_thread.thread = NULL;
@@ -722,7 +798,7 @@ FFI_EXPORT void ffi_scrcpy_stop(void* handle) {
     sc_mutex_destroy(&s->buffer_mutex);
 
     net_cleanup();
-    
+
 #if defined(__APPLE__)
     if (s->software_pixel_buffer) {
         CVPixelBufferRelease((CVPixelBufferRef)s->software_pixel_buffer);
@@ -933,7 +1009,13 @@ scrcpy_ffi_log_d3d11_capabilities(ID3D11Device *device,
                                   const AVCodecContext *codec_ctx);
 #endif
 
+static ScrcpyCodecBinding *
+scrcpy_ffi_codec_binding(AVCodecContext *avctx);
+
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+    ScrcpyCodecBinding *binding = scrcpy_ffi_codec_binding(ctx);
+    enum AVPixelFormat expected_hw_format = binding ? binding->expected_hw_format : AV_PIX_FMT_NONE;
+
     LOGD("FFI: decoder pixel formats offered for codec=%s size=%dx%d:",
          ctx && ctx->codec ? ctx->codec->name : "unknown",
          ctx ? ctx->coded_width : 0, ctx ? ctx->coded_height : 0);
@@ -942,8 +1024,8 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelF
         const char *name = av_get_pix_fmt_name(*p);
         LOGD("FFI:   format[%u]=%s (%d)%s", index++,
              name ? name : "unknown", *p,
-             *p == t_expected_hw_format ? " [required]" : "");
-        if (*p == t_expected_hw_format) {
+             *p == expected_hw_format ? " [required]" : "");
+        if (*p == expected_hw_format && expected_hw_format != AV_PIX_FMT_NONE) {
             LOGD("FFI: selected required hardware pixel format %s",
                  name ? name : "unknown");
 #if defined(_WIN32)
@@ -965,16 +1047,18 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelF
     }
     LOGE("FFI: decoder did not offer required hardware pixel format %s; "
          "D3D11VA may have removed it after hardware initialization failed",
-         av_get_pix_fmt_name(t_expected_hw_format));
+         av_get_pix_fmt_name(expected_hw_format));
     return AV_PIX_FMT_NONE;
 }
 
 FFI_EXPORT void ffi_scrcpy_set_d3d11_device(void* handle, void* d3d11_device) {
 #if defined(_WIN32)
     ScrcpyFfiInstance* s = (ScrcpyFfiInstance*)handle;
-    ID3D11Device *device = (ID3D11Device *)d3d11_device;
-    if (s && device) {
-        sc_mutex_lock(&s->mutex);
+    if (!s) return;
+
+    sc_mutex_lock(&s->mutex);
+    if (d3d11_device) {
+        ID3D11Device *device = (ID3D11Device *)d3d11_device;
         if (!s->d3d11_device) {
             // Keep one instance-owned reference. The AVHWDeviceContext takes
             // a separate reference when the video decoder is initialized.
@@ -985,10 +1069,16 @@ FFI_EXPORT void ffi_scrcpy_set_d3d11_device(void* handle, void* d3d11_device) {
             sc_mutex_unlock(&s->mutex);
             return;
         }
-        atomic_store(&s->gpu_context_ready, true);
-        sc_cond_broadcast(&s->cond);
-        sc_mutex_unlock(&s->mutex);
+    } else {
+        // No D3D11 device available (EnsureD3D11Device failed).
+        // Enable software decode fallback so the worker is not blocked forever.
+        LOGW("FFI: No D3D11 device provided; enabling software decode fallback.");
+        s->software_decoding = true;
     }
+    // Always unblock the worker thread regardless of whether a device was bound.
+    atomic_store(&s->gpu_context_ready, true);
+    sc_cond_broadcast(&s->cond);
+    sc_mutex_unlock(&s->mutex);
 #else
     (void)handle;
     (void)d3d11_device;
@@ -1097,13 +1187,12 @@ int sc_avcodec_open2(AVCodecContext *avctx, const AVCodec *codec, AVDictionary *
 
     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
         if (s && s->software_decoding) {
-            LOGD("FFI: Software decoding requested via options, skipping hardware acceleration setup.");
+            LOGD("FFI: Software decoding requested, skipping hardware acceleration setup.");
         } else if (!scrcpy_ffi_setup_hwaccel(avctx, codec)) {
-            // Hardware acceleration failed.
-            LOGE("FFI: Failed to setup hardware acceleration, but fallback is disabled. Returning ENOSYS.");
-            avctx->opaque = NULL;
-            free(binding);
-            return AVERROR(ENOSYS);
+            // HW init failed: fall back to software decode instead of hard-failing.
+            // This mirrors macOS behaviour where YUV420P frames are rendered via CPU.
+            LOGW("FFI: Hardware acceleration unavailable, falling back to software decode.");
+            if (s) s->software_decoding = true;
         }
     }
     int ret = avcodec_open2(avctx, codec, options);
@@ -1285,7 +1374,10 @@ bool scrcpy_ffi_setup_hwaccel(AVCodecContext *ctx, const AVCodec *codec) {
     if (!ctx->hw_device_ctx) {
         return false;
     }
-    t_expected_hw_format = selected_format;
+    ScrcpyCodecBinding *binding = scrcpy_ffi_codec_binding(ctx);
+    if (binding) {
+        binding->expected_hw_format = selected_format;
+    }
     ctx->get_format = get_hw_format;
     ctx->hwaccel_flags |= AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
     LOGD("FFI: GPU-only decoder configured: codec=%s device=%s format=%s",
@@ -1409,7 +1501,11 @@ ffi_scrcpy_acquire_gpu_frame(void* handle, ScrcpyGpuFrame* out_frame) {
     memset(out_frame, 0, sizeof(*out_frame));
 
     sc_mutex_lock(&s->buffer_mutex);
-    if (!s->current_frame || !s->current_frame->hw_frames_ctx) {
+    // Accept both hardware frames (hw_frames_ctx != NULL) and software frames
+    // (hw_frames_ctx == NULL) so that the Windows software-decode fallback path
+    // can deliver YUV420P frames to the texture layer.
+    if (!s->current_frame || !s->current_frame->data[0] ||
+        s->current_frame->width <= 0 || s->current_frame->height <= 0) {
         sc_mutex_unlock(&s->buffer_mutex);
         return false;
     }
@@ -1425,6 +1521,13 @@ ffi_scrcpy_acquire_gpu_frame(void* handle, ScrcpyGpuFrame* out_frame) {
 #if defined(_WIN32)
     if (frame->format == AV_PIX_FMT_D3D11 || frame->format == AV_PIX_FMT_D3D11VA) {
         backend = SCRCPY_GPU_FRAME_D3D11;
+    } else if (!frame->hw_frames_ctx &&
+               (frame->format == AV_PIX_FMT_YUV420P ||
+                frame->format == AV_PIX_FMT_YUVJ420P)) {
+        // Software-decoded frame on Windows: expose to the texture layer for
+        // CPU upload (sws_scale -> UpdateSubresource). This is the fallback
+        // when D3D11VA hardware acceleration is unavailable.
+        backend = SCRCPY_GPU_FRAME_SOFTWARE;
     }
 #elif defined(__APPLE__)
     if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
@@ -1443,16 +1546,18 @@ ffi_scrcpy_acquire_gpu_frame(void* handle, ScrcpyGpuFrame* out_frame) {
     out_frame->frame_ref = frame;
     // AV_PIX_FMT_D3D11 stores ID3D11Texture2D* in data[0] and its array slice
     // in data[1]. data[3]/data[4] are used by other hardware frame backends.
+    // Software frames expose no native_handle; the texture layer reads frame_ref.
 #if defined(_WIN32)
     if (backend == SCRCPY_GPU_FRAME_D3D11) {
         out_frame->native_handle = frame->data[0];
         out_frame->texture_index = (int32_t)(intptr_t)frame->data[1];
     } else
 #endif
-    {
+    if (backend != SCRCPY_GPU_FRAME_SOFTWARE) {
         out_frame->native_handle = frame->data[3];
         out_frame->texture_index = (int32_t)(intptr_t)frame->data[4];
     }
+    // SCRCPY_GPU_FRAME_SOFTWARE: native_handle stays NULL; frame_ref is the AVFrame*.
     out_frame->serial = serial;
     out_frame->backend = backend;
     out_frame->width = frame->width;
@@ -1471,6 +1576,48 @@ ffi_scrcpy_release_gpu_frame(ScrcpyGpuFrame* frame) {
     AVFrame *avframe = (AVFrame *)frame->frame_ref;
     av_frame_free(&avframe);
     memset(frame, 0, sizeof(*frame));
+}
+
+FFI_EXPORT bool
+ffi_scrcpy_convert_software_frame_to_bgra(
+    void* frame_ref,
+    uint8_t* dst_bgra,
+    int32_t dst_stride,
+    int32_t width,
+    int32_t height
+) {
+    if (!frame_ref || !dst_bgra || width <= 0 || height <= 0 || dst_stride <= 0) {
+        return false;
+    }
+    AVFrame* frame = (AVFrame*)frame_ref;
+    if (!frame->data[0]) {
+        return false;
+    }
+    enum AVPixelFormat src_fmt = (enum AVPixelFormat)frame->format;
+    if (src_fmt == AV_PIX_FMT_NONE || src_fmt < 0) {
+        return false;
+    }
+
+    struct SwsContext* sws = sws_getContext(
+        width, height, src_fmt,
+        width, height, AV_PIX_FMT_BGRA,
+        SWS_BILINEAR, NULL, NULL, NULL
+    );
+    if (!sws) {
+        return false;
+    }
+
+    uint8_t* dst_data[4] = { dst_bgra, NULL, NULL, NULL };
+    int dst_linesize[4] = { dst_stride, 0, 0, 0 };
+    sws_scale(
+        sws,
+        (const uint8_t* const*)frame->data,
+        frame->linesize,
+        0, height,
+        dst_data, dst_linesize
+    );
+    sws_freeContext(sws);
+    return true;
 }
 
 FFI_EXPORT void* ffi_scrcpy_get_d3d11_texture(void* handle, int* out_index) {
