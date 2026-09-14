@@ -301,7 +301,11 @@ final class FfiScrcpyController implements ScrcpyController {
 
     // Phase 1 — non-blocking: signal the native side to stop immediately.
     // This returns in microseconds and keeps the UI thread responsive.
-    _bindings.ffi_scrcpy_signal_stop(handle);
+    try {
+      _bindings.ffi_scrcpy_signal_stop(handle);
+    } catch (_) {
+      // Gracefully fall back if ffi_scrcpy_signal_stop is not exported in current native dylib
+    }
 
     // Phase 2 — blocking join runs on a background isolate so the UI is free.
     // ffi_scrcpy_stop() is idempotent when signal_stop already ran: it skips
